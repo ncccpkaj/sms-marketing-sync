@@ -4,7 +4,7 @@
  * Description: Lightweight WooCommerce order sync for the external SMS marketing system.
  * Version: 1.0.0
  * Author: Nayeem Hasan
- * Plugin URI: https://github.com/nayeemhasan/sms-marketing-sync
+ * Plugin URI: https://github.com/ncccpkaj/sms-marketing-sync
  */
 
 if (!defined('ABSPATH')) {
@@ -152,7 +152,7 @@ function sms_marketing_sync_settings_page(): void
             <div class="sms-sync-card sms-sync-meta">
                 <h2>Repository</h2>
                 <p>This public plugin repository is maintained by Nayeem Hasan.</p>
-                <p><a class="button button-secondary" href="https://github.com/nayeemhasan/sms-marketing-sync" target="_blank" rel="noopener">Open GitHub Repository</a></p>
+                <p><a class="button button-secondary" href="https://github.com/ncccpkaj/sms-marketing-sync" target="_blank" rel="noopener">Open GitHub Repository</a></p>
                 <p><strong>Outer system setup:</strong> download the SMS system from GitHub, upload it to hosting, edit `.env`, run setup, add the single queue cron, then paste the system URL and secret here.</p>
                 <code>cron/run-queues.php?token=YOUR_CRON_TOKEN</code>
             </div>
