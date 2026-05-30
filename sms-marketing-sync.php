@@ -128,11 +128,11 @@ function sms_marketing_sync_settings_page(): void
                     <table class="form-table" role="presentation">
                         <tr>
                             <th scope="row"><label for="sms-api-base-url">SMS System URL</label></th>
-                            <td><input id="sms-api-base-url" class="regular-text" name="<?php echo esc_attr(SMS_MARKETING_SYNC_OPTION); ?>[api_base_url]" value="<?php echo esc_attr($settings['api_base_url']); ?>"></td>
+                            <td><input id="sms-api-base-url" class="regular-text" style="height:38px;border: 1px solid #eee;border-radius: 8px;padding:4px 8px" name="<?php echo esc_attr(SMS_MARKETING_SYNC_OPTION); ?>[api_base_url]" value="<?php echo esc_attr($settings['api_base_url']); ?>"></td>
                         </tr>
                         <tr>
                             <th scope="row"><label for="sms-sync-secret">Sync Secret</label></th>
-                            <td><input id="sms-sync-secret" class="regular-text" name="<?php echo esc_attr(SMS_MARKETING_SYNC_OPTION); ?>[sync_secret]" value="<?php echo esc_attr($settings['sync_secret']); ?>"></td>
+                            <td><input id="sms-sync-secret" class="regular-text" style="height:38px;border: 1px solid #eee;border-radius: 8px;padding:4px 8px" name="<?php echo esc_attr(SMS_MARKETING_SYNC_OPTION); ?>[sync_secret]" value="<?php echo esc_attr($settings['sync_secret']); ?>"></td>
                         </tr>
                         <tr>
                             <th scope="row">Sync Order Statuses</th>
@@ -154,7 +154,6 @@ function sms_marketing_sync_settings_page(): void
                 <p>This public plugin repository is maintained by Nayeem Hasan.</p>
                 <p><a class="button button-secondary" href="https://github.com/ncccpkaj/sms-marketing-sync" target="_blank" rel="noopener">Open GitHub Repository</a></p>
                 <p><strong>Outer system setup:</strong> download the SMS system from GitHub, upload it to hosting, edit `.env`, run setup, add the single queue cron, then paste the system URL and secret here.</p>
-                <code>cron/run-queues.php?token=YOUR_CRON_TOKEN</code>
             </div>
         </div>
     </div>
