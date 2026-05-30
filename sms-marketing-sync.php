@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SMS Marketing Sync
  * Description: Lightweight WooCommerce order sync for the external SMS marketing system.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: Nayeem Hasan
  * Plugin URI: https://github.com/ncccpkaj/sms-marketing-sync
  */
@@ -167,13 +167,43 @@ function sms_marketing_sync_register_rest_routes(): void
         'callback' => 'sms_marketing_sync_rest_orders',
         'permission_callback' => 'sms_marketing_sync_rest_permission',
     ]);
+    register_rest_route('sms-marketing-sync/v1', '/users', [
+        'methods' => 'GET',
+        'callback' => 'sms_marketing_sync_rest_users',
+        'permission_callback' => 'sms_marketing_sync_rest_permission',
+    ]);
 }
 
-function sms_marketing_sync_rest_permission(WP_REST_Request $request): bool
+function sms_marketing_sync_rest_permission(WP_REST_Request $request)
 {
     $settings = sms_marketing_sync_settings();
-    $secret = (string) ($request->get_header('x-sms-sync-key') ?: $request->get_param('secret'));
-    return $secret !== '' && hash_equals((string) $settings['sync_secret'], $secret);
+    $secret = (string) $settings['sync_secret'];
+    $sentKey = (string) $request->get_header('x-sms-sync-key');
+    $timestamp = (string) $request->get_header('x-sms-sync-timestamp');
+    $signature = (string) $request->get_header('x-sms-sync-signature');
+
+    if ($secret === '' || $sentKey === '' || !hash_equals($secret, $sentKey)) {
+        return new WP_Error('sms_sync_unauthorized', 'Unauthorized.', ['status' => 401]);
+    }
+    if ($timestamp === '' || !ctype_digit($timestamp) || abs(time() - (int) $timestamp) > 300) {
+        return new WP_Error('sms_sync_stale_request', 'Request timestamp is invalid or expired.', ['status' => 401]);
+    }
+    if ($signature === '') {
+        return new WP_Error('sms_sync_missing_signature', 'Request signature is required.', ['status' => 401]);
+    }
+
+    $query = $request->get_query_params();
+    unset($query['secret']);
+    ksort($query);
+    $queryString = http_build_query($query);
+    $base = strtoupper($request->get_method()) . "\n" . $request->get_route() . "\n" . $queryString . "\n" . $timestamp;
+    $expected = hash_hmac('sha256', $base, $secret);
+
+    if (!hash_equals($expected, $signature)) {
+        return new WP_Error('sms_sync_bad_signature', 'Request signature is invalid.', ['status' => 401]);
+    }
+
+    return true;
 }
 
 function sms_marketing_sync_rest_orders(WP_REST_Request $request): WP_REST_Response
@@ -215,6 +245,46 @@ function sms_marketing_sync_rest_orders(WP_REST_Request $request): WP_REST_Respo
         'total' => (int) $result->total,
         'max_pages' => (int) $result->max_num_pages,
         'orders' => $orders,
+    ]);
+}
+
+function sms_marketing_sync_rest_users(WP_REST_Request $request): WP_REST_Response
+{
+    $page = max(1, (int) $request->get_param('page'));
+    $perPage = max(1, min(100, (int) ($request->get_param('per_page') ?: 50)));
+
+    $query = new WP_User_Query([
+        'role__in' => ['subscriber', 'customer'],
+        'number' => $perPage,
+        'paged' => $page,
+        'orderby' => 'ID',
+        'order' => 'ASC',
+        'count_total' => true,
+        'fields' => 'all',
+    ]);
+
+    $users = [];
+    foreach ($query->get_results() as $user) {
+        if (!$user instanceof WP_User) {
+            continue;
+        }
+        if (array_intersect(['administrator', 'editor', 'shop_manager'], (array) $user->roles)) {
+            continue;
+        }
+        $payload = sms_marketing_sync_build_user_payload($user);
+        if ($payload !== null) {
+            $users[] = $payload;
+        }
+    }
+
+    $total = (int) $query->get_total();
+    return new WP_REST_Response([
+        'ok' => true,
+        'page' => $page,
+        'per_page' => $perPage,
+        'total' => $total,
+        'max_pages' => (int) ceil($total / $perPage),
+        'users' => $users,
     ]);
 }
 
@@ -363,6 +433,45 @@ function sms_marketing_sync_build_order_payload(WC_Order $order, string $normali
             'address' => $billingAddress,
         ],
         'items' => $items,
+    ];
+}
+
+function sms_marketing_sync_build_user_payload(WP_User $user): ?array
+{
+    $phone = '';
+    foreach (['billing_phone', 'phone', 'mobile', 'user_phone'] as $metaKey) {
+        $phone = (string) get_user_meta($user->ID, $metaKey, true);
+        if ($phone !== '') {
+            break;
+        }
+    }
+
+    $normalizedPhone = sms_marketing_sync_normalize_bd_phone($phone);
+    if ($normalizedPhone === null) {
+        return null;
+    }
+
+    $firstName = (string) get_user_meta($user->ID, 'first_name', true);
+    $lastName = (string) get_user_meta($user->ID, 'last_name', true);
+    $billingName = trim((string) get_user_meta($user->ID, 'billing_first_name', true) . ' ' . (string) get_user_meta($user->ID, 'billing_last_name', true));
+    $name = trim($billingName ?: trim($firstName . ' ' . $lastName) ?: $user->display_name);
+    $address = trim(implode(', ', array_filter([
+        get_user_meta($user->ID, 'billing_address_1', true),
+        get_user_meta($user->ID, 'billing_address_2', true),
+        get_user_meta($user->ID, 'billing_city', true),
+        get_user_meta($user->ID, 'billing_state', true),
+        get_user_meta($user->ID, 'billing_postcode', true),
+        get_user_meta($user->ID, 'billing_country', true),
+    ])));
+
+    return [
+        'user_id' => $user->ID,
+        'roles' => array_values(array_intersect(['subscriber', 'customer'], (array) $user->roles)),
+        'name' => $name,
+        'phone' => $phone,
+        'phone_normalized' => $normalizedPhone,
+        'email' => (string) $user->user_email,
+        'address' => $address,
     ];
 }
 
