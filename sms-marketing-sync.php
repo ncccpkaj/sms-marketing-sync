@@ -331,23 +331,22 @@ function sms_marketing_sync_build_order_payload(WC_Order $order, string $normali
             continue;
         }
         $product = $item->get_product();
-        if (!$product) {
-            continue;
-        }
-        $parentId = $product->is_type('variation') ? $product->get_parent_id() : $product->get_id();
+        $productId = (int) $item->get_product_id();
+        $variationId = (int) $item->get_variation_id();
+        $parentId = $product ? ($product->is_type('variation') ? $product->get_parent_id() : $product->get_id()) : $productId;
         $quantity = max(1, (int) $item->get_quantity());
         $lineTotal = (float) $item->get_total();
 
         $items[] = [
             'product_id' => $parentId,
-            'variation_id' => $product->is_type('variation') ? $product->get_id() : 0,
-            'product_name' => $item->get_name(),
-            'product_type' => $product->get_type(),
+            'variation_id' => $product ? ($product->is_type('variation') ? $product->get_id() : 0) : $variationId,
+            'product_name' => $item->get_name() ?: 'Deleted product #' . ($productId ?: $variationId),
+            'product_type' => $product ? $product->get_type() : 'deleted',
             'quantity' => $quantity,
             'unit_total' => $quantity > 0 ? $lineTotal / $quantity : $lineTotal,
             'line_total' => $lineTotal,
-            'categories' => sms_marketing_sync_terms($parentId, 'product_cat'),
-            'brands' => sms_marketing_sync_product_brands($parentId),
+            'categories' => $product ? sms_marketing_sync_terms($parentId, 'product_cat') : [],
+            'brands' => $product ? sms_marketing_sync_product_brands($parentId) : [],
         ];
     }
 
