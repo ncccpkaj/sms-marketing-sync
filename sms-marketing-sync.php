@@ -17,6 +17,7 @@ const SMS_MARKETING_SYNC_GROUP = 'sms-marketing-sync';
 
 register_activation_hook(__FILE__, 'sms_marketing_sync_activate');
 add_action('admin_menu', 'sms_marketing_sync_admin_menu');
+add_action('admin_init', 'sms_marketing_sync_admin_error_display_guard', 0);
 add_action('admin_init', 'sms_marketing_sync_register_settings');
 add_action('woocommerce_order_status_changed', 'sms_marketing_sync_maybe_schedule_order', 10, 4);
 add_action(SMS_MARKETING_SYNC_ACTION, 'sms_marketing_sync_send_order');
@@ -71,8 +72,22 @@ function sms_marketing_sync_register_settings(): void
     ]);
 }
 
-function sms_marketing_sync_sanitize_settings(array $input): array
+function sms_marketing_sync_admin_error_display_guard(): void
 {
+    if (!is_admin() || (string) ($_GET['page'] ?? '') !== 'sms-marketing-sync') {
+        return;
+    }
+
+    if (defined('E_DEPRECATED')) {
+        error_reporting(error_reporting() & ~E_DEPRECATED & ~E_USER_DEPRECATED);
+    }
+    @ini_set('display_errors', '0');
+}
+
+function sms_marketing_sync_sanitize_settings($input): array
+{
+    $input = is_array($input) ? $input : [];
+
     return [
         'api_base_url' => esc_url_raw(rtrim((string) ($input['api_base_url'] ?? ''), '/')),
         'sync_secret' => sanitize_text_field((string) ($input['sync_secret'] ?? '')),
@@ -169,7 +184,12 @@ function sms_marketing_sync_register_rest_routes(): void
     ]);
     register_rest_route('sms-marketing-sync/v1', '/users', [
         'methods' => 'GET',
-        'callback' => 'sms_marketing_sync_rest_users',
+        'callback' => 'sms_marketing_sync_rest_customers',
+        'permission_callback' => 'sms_marketing_sync_rest_permission',
+    ]);
+    register_rest_route('sms-marketing-sync/v1', '/customers', [
+        'methods' => 'GET',
+        'callback' => 'sms_marketing_sync_rest_customers',
         'permission_callback' => 'sms_marketing_sync_rest_permission',
     ]);
 }
@@ -215,7 +235,7 @@ function sms_marketing_sync_rest_orders(WP_REST_Request $request): WP_REST_Respo
     $page = max(1, (int) $request->get_param('page'));
     $perPage = max(1, min(100, (int) ($request->get_param('per_page') ?: 50)));
     $statuses = array_filter(array_map('sanitize_key', explode(',', (string) ($request->get_param('statuses') ?: 'completed,processing'))));
-    $statuses = array_map(static fn ($status) => str_starts_with($status, 'wc-') ? $status : 'wc-' . $status, $statuses);
+    $statuses = array_map('sms_marketing_sync_normalize_wc_status', $statuses);
 
     $result = wc_get_orders([
         'status' => $statuses,
@@ -248,44 +268,87 @@ function sms_marketing_sync_rest_orders(WP_REST_Request $request): WP_REST_Respo
     ]);
 }
 
-function sms_marketing_sync_rest_users(WP_REST_Request $request): WP_REST_Response
+function sms_marketing_sync_rest_customers(WP_REST_Request $request): WP_REST_Response
 {
     $page = max(1, (int) $request->get_param('page'));
     $perPage = max(1, min(100, (int) ($request->get_param('per_page') ?: 50)));
 
-    $query = new WP_User_Query([
-        'role__in' => ['subscriber', 'customer'],
-        'number' => $perPage,
-        'paged' => $page,
-        'orderby' => 'ID',
-        'order' => 'ASC',
-        'count_total' => true,
-        'fields' => 'all',
-    ]);
+    $result = sms_marketing_sync_query_customer_candidates($page, $perPage);
+    $customerIds = array_map('sms_marketing_sync_customer_row_id', $result['rows']);
+    if ($customerIds) {
+        update_meta_cache('user', $customerIds);
+    }
 
-    $users = [];
-    foreach ($query->get_results() as $user) {
-        if (!$user instanceof WP_User) {
-            continue;
-        }
-        if (array_intersect(['administrator', 'editor', 'shop_manager'], (array) $user->roles)) {
-            continue;
-        }
-        $payload = sms_marketing_sync_build_user_payload($user);
+    $customers = [];
+    foreach ($result['rows'] as $row) {
+        $payload = sms_marketing_sync_build_customer_payload_from_row($row);
         if ($payload !== null) {
-            $users[] = $payload;
+            $customers[] = $payload;
         }
     }
 
-    $total = (int) $query->get_total();
     return new WP_REST_Response([
         'ok' => true,
         'page' => $page,
         'per_page' => $perPage,
-        'total' => $total,
-        'max_pages' => (int) ceil($total / $perPage),
-        'users' => $users,
+        'total' => $result['total'],
+        'max_pages' => (int) ceil($result['total'] / $perPage),
+        'customers' => $customers,
+        'users' => $customers,
     ]);
+}
+
+function sms_marketing_sync_query_customer_candidates(int $page, int $perPage): array
+{
+    global $wpdb;
+
+    $offset = ($page - 1) * $perPage;
+    $capKey = $wpdb->prefix . 'capabilities';
+    $lookupTable = $wpdb->prefix . 'wc_customer_lookup';
+    $lookupExists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $lookupTable)) === $lookupTable;
+    $lookupJoin = $lookupExists ? "LEFT JOIN {$lookupTable} wccl ON wccl.user_id = u.ID" : '';
+    $lookupWhere = $lookupExists ? ' OR wccl.user_id IS NOT NULL' : '';
+
+    $from = "{$wpdb->users} u
+        INNER JOIN {$wpdb->usermeta} pm ON pm.user_id = u.ID
+            AND pm.meta_key IN ('billing_phone', 'shipping_phone', 'phone', 'mobile', 'user_phone')
+            AND pm.meta_value <> ''
+        LEFT JOIN {$wpdb->usermeta} caps ON caps.user_id = u.ID AND caps.meta_key = %s
+        {$lookupJoin}";
+    $where = "(caps.meta_value LIKE %s{$lookupWhere})";
+
+    $sql = $wpdb->prepare(
+        "SELECT u.ID, u.user_email, u.display_name
+         FROM {$from}
+         WHERE {$where}
+         GROUP BY u.ID
+         ORDER BY u.ID ASC
+         LIMIT %d OFFSET %d",
+        $capKey,
+        '%customer%',
+        $perPage,
+        $offset
+    );
+    $rows = $wpdb->get_results($sql, ARRAY_A) ?: [];
+
+    $countSql = $wpdb->prepare(
+        "SELECT COUNT(DISTINCT u.ID) FROM {$from} WHERE {$where}",
+        $capKey,
+        '%customer%'
+    );
+    $total = (int) $wpdb->get_var($countSql);
+
+    return ['rows' => $rows, 'total' => $total];
+}
+
+function sms_marketing_sync_customer_row_id(array $row): int
+{
+    return (int) ($row['ID'] ?? 0);
+}
+
+function sms_marketing_sync_normalize_wc_status(string $status): string
+{
+    return sms_marketing_sync_starts_with($status, 'wc-') ? $status : 'wc-' . $status;
 }
 
 function sms_marketing_sync_enabled_statuses(): array
@@ -475,6 +538,49 @@ function sms_marketing_sync_build_user_payload(WP_User $user): ?array
     ];
 }
 
+function sms_marketing_sync_build_customer_payload_from_row(array $row): ?array
+{
+    $userId = (int) ($row['ID'] ?? 0);
+    if ($userId <= 0) {
+        return null;
+    }
+
+    $phone = '';
+    foreach (['billing_phone', 'shipping_phone', 'phone', 'mobile', 'user_phone'] as $metaKey) {
+        $phone = (string) get_user_meta($userId, $metaKey, true);
+        if ($phone !== '') {
+            break;
+        }
+    }
+
+    $normalizedPhone = sms_marketing_sync_normalize_bd_phone($phone);
+    if ($normalizedPhone === null) {
+        return null;
+    }
+
+    $billingName = trim((string) get_user_meta($userId, 'billing_first_name', true) . ' ' . (string) get_user_meta($userId, 'billing_last_name', true));
+    $shippingName = trim((string) get_user_meta($userId, 'shipping_first_name', true) . ' ' . (string) get_user_meta($userId, 'shipping_last_name', true));
+    $name = trim($billingName ?: $shippingName ?: (string) ($row['display_name'] ?? ''));
+    $address = trim(implode(', ', array_filter([
+        get_user_meta($userId, 'billing_address_1', true) ?: get_user_meta($userId, 'shipping_address_1', true),
+        get_user_meta($userId, 'billing_address_2', true) ?: get_user_meta($userId, 'shipping_address_2', true),
+        get_user_meta($userId, 'billing_city', true) ?: get_user_meta($userId, 'shipping_city', true),
+        get_user_meta($userId, 'billing_state', true) ?: get_user_meta($userId, 'shipping_state', true),
+        get_user_meta($userId, 'billing_postcode', true) ?: get_user_meta($userId, 'shipping_postcode', true),
+        get_user_meta($userId, 'billing_country', true) ?: get_user_meta($userId, 'shipping_country', true),
+    ])));
+
+    return [
+        'customer_id' => $userId,
+        'user_id' => $userId,
+        'name' => $name,
+        'phone' => $phone,
+        'phone_normalized' => $normalizedPhone,
+        'email' => (string) ($row['user_email'] ?? get_user_meta($userId, 'billing_email', true)),
+        'address' => $address,
+    ];
+}
+
 function sms_marketing_sync_terms(int $productId, string $taxonomy): array
 {
     if (!$productId || !taxonomy_exists($taxonomy)) {
@@ -486,10 +592,15 @@ function sms_marketing_sync_terms(int $productId, string $taxonomy): array
         return [];
     }
 
-    return array_values(array_map(static fn ($term) => [
+    return array_values(array_map('sms_marketing_sync_term_payload', $terms));
+}
+
+function sms_marketing_sync_term_payload($term): array
+{
+    return [
         'name' => $term->name,
         'slug' => $term->slug,
-    ], $terms));
+    ];
 }
 
 function sms_marketing_sync_product_brands(int $productId): array
@@ -511,13 +622,13 @@ function sms_marketing_sync_normalize_bd_phone(?string $phone): ?string
         return null;
     }
 
-    if (str_starts_with($digits, '0088')) {
+    if (sms_marketing_sync_starts_with($digits, '0088')) {
         $digits = substr($digits, 2);
     }
 
-    if (str_starts_with($digits, '88') && strlen($digits) === 13) {
+    if (sms_marketing_sync_starts_with($digits, '88') && strlen($digits) === 13) {
         $local = substr($digits, 2);
-    } elseif (str_starts_with($digits, '01') && strlen($digits) === 11) {
+    } elseif (sms_marketing_sync_starts_with($digits, '01') && strlen($digits) === 11) {
         $local = $digits;
     } else {
         return null;
@@ -537,4 +648,9 @@ function sms_marketing_sync_normalize_bd_phone(?string $phone): ?string
     }
 
     return '88' . $local;
+}
+
+function sms_marketing_sync_starts_with(string $value, string $prefix): bool
+{
+    return $prefix === '' || strncmp($value, $prefix, strlen($prefix)) === 0;
 }
