@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SMS Marketing Sync
  * Description: Lightweight WooCommerce order sync for the external SMS marketing system.
- * Version: 1.0.1
+ * Version: 1.0.2
  * Author: Nayeem Hasan
  * Plugin URI: https://github.com/ncccpkaj/sms-marketing-sync
  */
@@ -22,6 +22,10 @@ add_action('admin_init', 'sms_marketing_sync_register_settings');
 add_action('woocommerce_order_status_changed', 'sms_marketing_sync_maybe_schedule_order', 10, 4);
 add_action(SMS_MARKETING_SYNC_ACTION, 'sms_marketing_sync_send_order');
 add_action('rest_api_init', 'sms_marketing_sync_register_rest_routes');
+add_action('woocommerce_rest_insert_shop_order_object', 'sms_marketing_sync_maybe_schedule_rest_order', 10, 3);
+add_action('woocommerce_rest_insert_shop_order', 'sms_marketing_sync_maybe_schedule_legacy_rest_order', 10, 3);
+add_filter('handle_bulk_actions-edit-shop_order', 'sms_marketing_sync_maybe_schedule_bulk_orders', 100, 3);
+add_filter('handle_bulk_actions-woocommerce_page_wc-orders', 'sms_marketing_sync_maybe_schedule_bulk_orders', 100, 3);
 add_filter('plugin_action_links_' . plugin_basename(__FILE__), 'sms_marketing_sync_action_links');
 
 function sms_marketing_sync_activate(): void
@@ -370,47 +374,145 @@ function sms_marketing_sync_maybe_schedule_order(int $orderId, string $oldStatus
         return;
     }
 
-    if (!in_array($newStatus, sms_marketing_sync_enabled_statuses(), true)) {
+    $order = $order instanceof WC_Order ? $order : wc_get_order($orderId);
+    if (!$order instanceof WC_Order) {
         return;
     }
 
-    $order = $order instanceof WC_Order ? $order : wc_get_order($orderId);
-    if (!$order) {
+    sms_marketing_sync_maybe_schedule_order_object($order, $newStatus, 'status_changed');
+}
+
+function sms_marketing_sync_maybe_schedule_rest_order($order, $request, bool $creating): void
+{
+    if (!$order instanceof WC_Order || !$request instanceof WP_REST_Request) {
+        return;
+    }
+
+    if ($request->get_param('status') === null) {
+        return;
+    }
+
+    sms_marketing_sync_maybe_schedule_order_object($order, $order->get_status(), $creating ? 'rest_create' : 'rest_update');
+}
+
+function sms_marketing_sync_maybe_schedule_legacy_rest_order($post, $request, bool $creating): void
+{
+    if (!function_exists('wc_get_order') || !$request instanceof WP_REST_Request || $request->get_param('status') === null) {
+        return;
+    }
+
+    $orderId = is_object($post) && isset($post->ID) ? (int) $post->ID : 0;
+    $order = $orderId > 0 ? wc_get_order($orderId) : null;
+    if (!$order instanceof WC_Order) {
+        return;
+    }
+
+    sms_marketing_sync_maybe_schedule_order_object($order, $order->get_status(), $creating ? 'legacy_rest_create' : 'legacy_rest_update');
+}
+
+function sms_marketing_sync_maybe_schedule_bulk_orders(string $redirectTo, string $action, array $orderIds): string
+{
+    if (!function_exists('wc_get_order') || !sms_marketing_sync_starts_with($action, 'mark_')) {
+        return $redirectTo;
+    }
+
+    foreach ($orderIds as $orderId) {
+        $order = wc_get_order((int) $orderId);
+        if ($order instanceof WC_Order) {
+            sms_marketing_sync_maybe_schedule_order_object($order, $order->get_status(), 'admin_bulk_' . sanitize_key($action));
+        }
+    }
+
+    return $redirectTo;
+}
+
+function sms_marketing_sync_maybe_schedule_order_object(WC_Order $order, string $newStatus, string $source): void
+{
+    if (!in_array($newStatus, sms_marketing_sync_enabled_statuses(), true)) {
         return;
     }
 
     $normalizedPhone = sms_marketing_sync_normalize_bd_phone($order->get_billing_phone());
     if ($normalizedPhone === null) {
         $order->update_meta_data('_sms_marketing_sync_status', 'skipped_invalid_phone');
+        $order->update_meta_data('_sms_marketing_sync_error', 'Invalid Bangladesh billing phone.');
         $order->save();
         return;
     }
 
-    $args = ['order_id' => $orderId];
+    $orderId = (int) $order->get_id();
+    $args = [$orderId];
+    $actionId = 0;
+
     if (function_exists('as_enqueue_async_action')) {
-        as_enqueue_async_action(SMS_MARKETING_SYNC_ACTION, $args, SMS_MARKETING_SYNC_GROUP, true);
+        if (sms_marketing_sync_has_pending_action($args)) {
+            $order->update_meta_data('_sms_marketing_sync_status', 'scheduled');
+            $order->update_meta_data('_sms_marketing_sync_source', $source);
+            $order->save();
+            return;
+        }
+
+        $actionId = as_enqueue_async_action(SMS_MARKETING_SYNC_ACTION, $args, SMS_MARKETING_SYNC_GROUP, false);
     } else {
-        wp_schedule_single_event(time() + 10, SMS_MARKETING_SYNC_ACTION, $args);
+        $scheduled = wp_schedule_single_event(time() + 10, SMS_MARKETING_SYNC_ACTION, $args);
+        $actionId = $scheduled ? 1 : 0;
+    }
+
+    if (!$actionId) {
+        $order->update_meta_data('_sms_marketing_sync_status', 'failed_schedule');
+        $order->update_meta_data('_sms_marketing_sync_error', 'Could not enqueue sync action.');
+        $order->save();
+        return;
     }
 
     $order->update_meta_data('_sms_marketing_sync_status', 'scheduled');
+    $order->update_meta_data('_sms_marketing_sync_action_id', $actionId);
+    $order->update_meta_data('_sms_marketing_sync_source', $source);
+    $order->update_meta_data('_sms_marketing_sync_scheduled_at', current_time('mysql'));
+    $order->delete_meta_data('_sms_marketing_sync_error');
     $order->save();
 }
 
-function sms_marketing_sync_send_order(int $orderId): void
+function sms_marketing_sync_has_pending_action(array $args): bool
+{
+    if (function_exists('as_next_scheduled_action')) {
+        return (bool) as_next_scheduled_action(SMS_MARKETING_SYNC_ACTION, $args, SMS_MARKETING_SYNC_GROUP);
+    }
+
+    if (function_exists('as_next_scheduled')) {
+        return (bool) as_next_scheduled(SMS_MARKETING_SYNC_ACTION, $args, SMS_MARKETING_SYNC_GROUP);
+    }
+
+    return false;
+}
+
+function sms_marketing_sync_send_order($orderId): void
 {
     if (!function_exists('wc_get_order')) {
         return;
     }
+
+    if (is_array($orderId)) {
+        $orderId = (int) ($orderId['order_id'] ?? reset($orderId));
+    }
+    $orderId = (int) $orderId;
 
     $order = wc_get_order($orderId);
     if (!$order) {
         return;
     }
 
+    if (!in_array($order->get_status(), sms_marketing_sync_enabled_statuses(), true)) {
+        $order->update_meta_data('_sms_marketing_sync_status', 'skipped_status');
+        $order->update_meta_data('_sms_marketing_sync_error', 'Order status is no longer enabled for sync.');
+        $order->save();
+        return;
+    }
+
     $phone = sms_marketing_sync_normalize_bd_phone($order->get_billing_phone());
     if ($phone === null) {
         $order->update_meta_data('_sms_marketing_sync_status', 'skipped_invalid_phone');
+        $order->update_meta_data('_sms_marketing_sync_error', 'Invalid Bangladesh billing phone.');
         $order->save();
         return;
     }
@@ -435,12 +537,18 @@ function sms_marketing_sync_send_order(int $orderId): void
 
     $code = wp_remote_retrieve_response_code($response);
     $body = wp_remote_retrieve_body($response);
+    $decoded = json_decode($body, true);
+    $apiRejected = is_array($decoded) && (
+        (array_key_exists('ok', $decoded) && $decoded['ok'] === false)
+        || (array_key_exists('success', $decoded) && $decoded['success'] === false)
+    );
+
     $order->update_meta_data('_sms_marketing_sync_http_code', $code);
     $order->update_meta_data('_sms_marketing_sync_response', wp_trim_words($body, 40));
-    $order->update_meta_data('_sms_marketing_sync_status', $code >= 200 && $code < 300 ? 'synced' : 'failed');
+    $order->update_meta_data('_sms_marketing_sync_status', $code >= 200 && $code < 300 && !$apiRejected ? 'synced' : 'failed');
     $order->save();
 
-    if ($code < 200 || $code >= 300) {
+    if ($code < 200 || $code >= 300 || $apiRejected) {
         throw new RuntimeException('SMS sync failed with HTTP ' . $code . ': ' . $body);
     }
 }
